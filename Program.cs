@@ -219,6 +219,7 @@ namespace AssemblySplitter
             // Remove types
             foreach (var type in typesToRemove.Where(t => t.DeclaringType == null))
             {
+                //Console.WriteLine($"Removed {type} from AOT assembly");
                 assembly.MainModule.Types.Remove(type);
             }
 
@@ -1059,10 +1060,21 @@ namespace AssemblySplitter
                 }
             }
 
+            foreach (var nestedType in type.NestedTypes)
+            {
+                AddDependencyIfInAssembly(nestedType, allTypeNames, dependencies);
+            }
+
             // Remove self-reference
             dependencies.Remove(type.FullName);
             
             graph[type.FullName] = dependencies;
+
+            // Process nested types
+            foreach (var nestedType in type.NestedTypes)
+            {
+                BuildTypeDependencies(nestedType, allTypeNames, graph);
+            }
         }
 
         private void AddDependencyIfInAssembly(TypeReference typeRef, HashSet<string> allTypeNames, 
