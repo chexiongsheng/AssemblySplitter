@@ -61,84 +61,6 @@ namespace AssemblySplitter
         }
     }
 
-    /// <summary>
-    /// Custom assembly resolver that doesn't throw exceptions for unresolved assemblies
-    /// </summary>
-    internal class SafeAssemblyResolver : DefaultAssemblyResolver
-    {
-        public override AssemblyDefinition Resolve(AssemblyNameReference name)
-        {
-            try
-            {
-                return base.Resolve(name);
-            }
-            catch
-            {
-                // Return null instead of throwing - this allows Cecil to continue
-                // even when dependencies can't be resolved
-                return null;
-            }
-        }
-
-        public override AssemblyDefinition Resolve(AssemblyNameReference name, ReaderParameters parameters)
-        {
-            try
-            {
-                return base.Resolve(name, parameters);
-            }
-            catch
-            {
-                return null;
-            }
-        }
-    }
-
-    /// <summary>
-    /// Custom metadata resolver that handles unresolved types gracefully
-    /// </summary>
-    internal class SafeMetadataResolver : MetadataResolver
-    {
-        public SafeMetadataResolver(IAssemblyResolver assemblyResolver) : base(assemblyResolver)
-        {
-        }
-
-        public override TypeDefinition Resolve(TypeReference type)
-        {
-            try
-            {
-                return base.Resolve(type);
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        public override FieldDefinition Resolve(FieldReference field)
-        {
-            try
-            {
-                return base.Resolve(field);
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        public override MethodDefinition Resolve(MethodReference method)
-        {
-            try
-            {
-                return base.Resolve(method);
-            }
-            catch
-            {
-                return null;
-            }
-        }
-    }
-
     internal class AssemblySplitter
     {
         private readonly string _assemblyPath;
@@ -211,9 +133,9 @@ namespace AssemblySplitter
             }
         }
 
-        private SafeAssemblyResolver CreateResolver(string baseDirectory)
+        private void AddSearchDirectorys(BaseAssemblyResolver resolver, string baseDirectory)
         {
-            var resolver = new SafeAssemblyResolver();
+            if (resolver == null) return;
             resolver.AddSearchDirectory(baseDirectory);
             Console.WriteLine($"  Added search directory: {baseDirectory}");
             
@@ -226,8 +148,6 @@ namespace AssemblySplitter
                     Console.WriteLine($"  Added search directory: {dir}");
                 }
             }
-            
-            return resolver;
         }
 
         public void Split()
@@ -246,11 +166,11 @@ namespace AssemblySplitter
             HashSet<string> typesToMoveToAot;
             var analysisReaderParams = new ReaderParameters
             {
-                AssemblyResolver = CreateResolver(Path.GetDirectoryName(_assemblyPath) ?? "."),
                 ReadingMode = ReadingMode.Deferred  // Deferred mode to avoid resolving all dependencies upfront
             };
             using (var assembly = AssemblyDefinition.ReadAssembly(_assemblyPath, analysisReaderParams))
             {
+                AddSearchDirectorys(assembly.MainModule.AssemblyResolver as BaseAssemblyResolver, Path.GetDirectoryName(_aotAssemblyPath) ?? ".");
                 var dependencyGraph = BuildDependencyGraph(assembly);
                 var typeDepths = CalculateTypeDepths(dependencyGraph);
                 
@@ -291,20 +211,18 @@ namespace AssemblySplitter
         /// </summary>
         private void ModifyAotAssembly(HashSet<string> typesToKeep)
         {
-            var resolver = CreateResolver(Path.GetDirectoryName(_aotAssemblyPath) ?? ".");
-
             // Read assembly into memory to avoid file locking issues
             // Use Deferred reading mode to avoid resolving dependencies eagerly
             var readerParams = new ReaderParameters
             {
-                AssemblyResolver = resolver,
-                MetadataResolver = new SafeMetadataResolver(resolver),
                 ReadingMode = ReadingMode.Deferred,
                 InMemory = true
             };
 
             using var assembly = AssemblyDefinition.ReadAssembly(_aotAssemblyPath, readerParams);
-            
+
+            AddSearchDirectorys(assembly.MainModule.AssemblyResolver as BaseAssemblyResolver, Path.GetDirectoryName(_aotAssemblyPath) ?? ".");
+
             // Change assembly name
             assembly.Name.Name = $"{_assemblyName}.AOT";
             assembly.MainModule.Name = $"{_assemblyName}.AOT.dll";
@@ -339,19 +257,17 @@ namespace AssemblySplitter
         /// </summary>
         private void ModifySourceAssembly(HashSet<string> typesToRemove)
         {
-            var resolver = CreateResolver(Path.GetDirectoryName(_assemblyPath) ?? ".");
-
             // Read assembly into memory to avoid file locking issues
             // Use Deferred reading mode to avoid resolving dependencies eagerly
             var readerParams = new ReaderParameters
             {
-                AssemblyResolver = resolver,
-                MetadataResolver = new SafeMetadataResolver(resolver),
                 ReadingMode = ReadingMode.Deferred,
                 InMemory = true
             };
 
             using var assembly = AssemblyDefinition.ReadAssembly(_assemblyPath, readerParams);
+
+            AddSearchDirectorys(assembly.MainModule.AssemblyResolver as BaseAssemblyResolver, Path.GetDirectoryName(_aotAssemblyPath) ?? ".");
 
             // Add reference to AOT assembly
             var aotRef = new AssemblyNameReference($"{_assemblyName}.AOT", assembly.Name.Version);
