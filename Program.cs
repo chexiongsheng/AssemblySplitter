@@ -1,0 +1,1753 @@
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using Mono.Cecil;
+using Mono.Cecil.Cil;
+namespace AssemblySplitter
+{
+    internal class Program
+    {
+        static void Main(string[] args)
+        {
+            if (args.Length < 2)
+            {
+                Console.WriteLine("Usage: AssemblySplitter <assembly_path> <depth> [search_directories]");
+                Console.WriteLine("  assembly_path: Path to the assembly to split (e.g., Scripts.GameCore.dll)");
+                Console.WriteLine("  depth: Depth parameter (must be >= 1)");
+                Console.WriteLine("  search_directories: Optional, semicolon-separated list of directories to search for dependencies");
+                return;
+            }
+
+            string assemblyPath = args[0];
+            if (!int.TryParse(args[1], out int depth) || depth < 1)
+            {
+                Console.WriteLine("Error: Depth must be an integer >= 1");
+                return;
+            }
+
+            if (!File.Exists(assemblyPath))
+            {
+                Console.WriteLine($"Error: Assembly not found: {assemblyPath}");
+                return;
+            }
+
+            // Parse optional search directories
+            var searchDirectories = new List<string>();
+            if (args.Length >= 3)
+            {
+                searchDirectories.AddRange(args[2].Split(';', StringSplitOptions.RemoveEmptyEntries));
+            }
+
+            var splitter = new AssemblySplitter(assemblyPath, depth, searchDirectories);
+            try
+            {
+                splitter.Split();
+                Console.WriteLine("Assembly split completed successfully.");
+                Console.WriteLine($"Backup preserved at: {assemblyPath}.backup");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error: {ex.Message}");
+                Console.WriteLine($"Stack trace:\n{ex.StackTrace}");
+                if (ex.InnerException != null)
+                {
+                    Console.WriteLine($"Inner exception: {ex.InnerException.Message}");
+                    Console.WriteLine($"Inner stack trace:\n{ex.InnerException.StackTrace}");
+                }
+                // Rollback on failure
+                splitter.Rollback();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Custom assembly resolver that doesn't throw exceptions for unresolved assemblies
+    /// </summary>
+    internal class SafeAssemblyResolver : DefaultAssemblyResolver
+    {
+        public override AssemblyDefinition Resolve(AssemblyNameReference name)
+        {
+            try
+            {
+                return base.Resolve(name);
+            }
+            catch
+            {
+                // Return null instead of throwing - this allows Cecil to continue
+                // even when dependencies can't be resolved
+                return null;
+            }
+        }
+
+        public override AssemblyDefinition Resolve(AssemblyNameReference name, ReaderParameters parameters)
+        {
+            try
+            {
+                return base.Resolve(name, parameters);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Custom metadata resolver that handles unresolved types gracefully
+    /// </summary>
+    internal class SafeMetadataResolver : MetadataResolver
+    {
+        public SafeMetadataResolver(IAssemblyResolver assemblyResolver) : base(assemblyResolver)
+        {
+        }
+
+        public override TypeDefinition Resolve(TypeReference type)
+        {
+            try
+            {
+                return base.Resolve(type);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        public override FieldDefinition Resolve(FieldReference field)
+        {
+            try
+            {
+                return base.Resolve(field);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        public override MethodDefinition Resolve(MethodReference method)
+        {
+            try
+            {
+                return base.Resolve(method);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+    }
+
+    internal class AssemblySplitter
+    {
+        private readonly string _assemblyPath;
+        private readonly int _depth;
+        private readonly string _aotAssemblyPath;
+        private readonly string _assemblyName;
+        private readonly string _backupPath;
+        private readonly List<string> _searchDirectories;
+
+        public AssemblySplitter(string assemblyPath, int depth, List<string> searchDirectories = null)
+        {
+            _assemblyPath = Path.GetFullPath(assemblyPath);
+            _depth = depth;
+            _assemblyName = Path.GetFileNameWithoutExtension(assemblyPath);
+            _searchDirectories = searchDirectories ?? new List<string>();
+            
+            string directory = Path.GetDirectoryName(_assemblyPath) ?? ".";
+            _aotAssemblyPath = Path.Combine(directory, $"{_assemblyName}.AOT.dll");
+            _backupPath = _assemblyPath + ".backup";
+        }
+
+        /// <summary>
+        /// Rollback changes: restore from backup and delete AOT assembly
+        /// </summary>
+        public void Rollback()
+        {
+            Console.WriteLine("\nRolling back changes...");
+            try
+            {
+                // Delete AOT assembly if it exists
+                if (File.Exists(_aotAssemblyPath))
+                {
+                    File.Delete(_aotAssemblyPath);
+                    Console.WriteLine($"  Deleted AOT assembly: {_aotAssemblyPath}");
+                }
+
+                // Restore from backup if it exists
+                if (File.Exists(_backupPath))
+                {
+                    File.Copy(_backupPath, _assemblyPath, true);
+                    Console.WriteLine($"  Restored from backup: {_assemblyPath}");
+                    File.Delete(_backupPath);
+                    Console.WriteLine($"  Deleted backup: {_backupPath}");
+                }
+
+                Console.WriteLine("Rollback completed.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Warning: Rollback failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Remove backup file after successful operation
+        /// </summary>
+        public void CleanupBackup()
+        {
+            try
+            {
+                if (File.Exists(_backupPath))
+                {
+                    File.Delete(_backupPath);
+                    Console.WriteLine($"Removed backup: {_backupPath}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Warning: Could not remove backup: {ex.Message}");
+            }
+        }
+
+        private SafeAssemblyResolver CreateResolver(string baseDirectory)
+        {
+            var resolver = new SafeAssemblyResolver();
+            resolver.AddSearchDirectory(baseDirectory);
+            Console.WriteLine($"  Added search directory: {baseDirectory}");
+            
+            // Add user-specified search directories
+            foreach (var dir in _searchDirectories)
+            {
+                if (Directory.Exists(dir))
+                {
+                    resolver.AddSearchDirectory(dir);
+                    Console.WriteLine($"  Added search directory: {dir}");
+                }
+            }
+            
+            return resolver;
+        }
+
+        public void Split()
+        {
+            // Check if AOT assembly already exists
+            if (File.Exists(_aotAssemblyPath))
+            {
+                throw new InvalidOperationException($"AOT assembly already exists: {_aotAssemblyPath}. Please remove it before splitting.");
+            }
+
+            // Create backup
+            File.Copy(_assemblyPath, _backupPath, true);
+            Console.WriteLine($"Backup created: {_backupPath}");
+
+            // Step 1: Analyze the assembly to determine which types to move
+            HashSet<string> typesToMoveToAot;
+            var analysisReaderParams = new ReaderParameters
+            {
+                AssemblyResolver = CreateResolver(Path.GetDirectoryName(_assemblyPath) ?? "."),
+                ReadingMode = ReadingMode.Deferred  // Deferred mode to avoid resolving all dependencies upfront
+            };
+            using (var assembly = AssemblyDefinition.ReadAssembly(_assemblyPath, analysisReaderParams))
+            {
+                var dependencyGraph = BuildDependencyGraph(assembly);
+                var typeDepths = CalculateTypeDepths(dependencyGraph);
+                
+                typesToMoveToAot = typeDepths
+                    .Where(kvp => kvp.Value <= _depth)
+                    .Select(kvp => kvp.Key)
+                    .ToHashSet();
+
+                if (typesToMoveToAot.Count == 0)
+                {
+                    Console.WriteLine("No types found to move at the specified depth.");
+                    return;
+                }
+
+                Console.WriteLine($"\nTypes to move to AOT assembly ({typesToMoveToAot.Count} types):");
+                foreach (var type in typesToMoveToAot.OrderBy(t => typeDepths[t]).ThenBy(t => t))
+                {
+                    Console.WriteLine($"  [Depth {typeDepths[type]}] {type}");
+                }
+            }
+
+            // Step 2: Copy assembly to AOT path
+            File.Copy(_assemblyPath, _aotAssemblyPath, true);
+            Console.WriteLine($"\nCopied assembly to: {_aotAssemblyPath}");
+
+            // Step 3: Modify the AOT assembly - remove types that should NOT be moved (keep only typesToMoveToAot)
+            ModifyAotAssembly(typesToMoveToAot);
+
+            // Step 4: Modify the source assembly - remove types that ARE moved, and update references
+            ModifySourceAssembly(typesToMoveToAot);
+
+            Console.WriteLine($"\nUpdated source assembly: {_assemblyPath}");
+            Console.WriteLine($"Created AOT assembly: {_aotAssemblyPath}");
+        }
+
+        /// <summary>
+        /// Modify AOT assembly: keep only types that should be moved, remove everything else
+        /// </summary>
+        private void ModifyAotAssembly(HashSet<string> typesToKeep)
+        {
+            var resolver = CreateResolver(Path.GetDirectoryName(_aotAssemblyPath) ?? ".");
+
+            // Read assembly into memory to avoid file locking issues
+            // Use Deferred reading mode to avoid resolving dependencies eagerly
+            var readerParams = new ReaderParameters
+            {
+                AssemblyResolver = resolver,
+                MetadataResolver = new SafeMetadataResolver(resolver),
+                ReadingMode = ReadingMode.Deferred,
+                InMemory = true
+            };
+
+            using var assembly = AssemblyDefinition.ReadAssembly(_aotAssemblyPath, readerParams);
+            
+            // Change assembly name
+            assembly.Name.Name = $"{_assemblyName}.AOT";
+            assembly.MainModule.Name = $"{_assemblyName}.AOT.dll";
+
+            // Collect types to remove (those NOT in typesToKeep)
+            var typesToRemove = new List<TypeDefinition>();
+            foreach (var type in assembly.MainModule.Types.ToList())
+            {
+                if (type.Name == "<Module>") continue;
+                CollectTypesToRemove(type, typesToKeep, typesToRemove, keepMatching: false);
+            }
+
+            // Remove types
+            foreach (var type in typesToRemove.Where(t => t.DeclaringType == null))
+            {
+                assembly.MainModule.Types.Remove(type);
+            }
+
+            // Also handle nested types
+            foreach (var type in typesToRemove.Where(t => t.DeclaringType != null))
+            {
+                type.DeclaringType.NestedTypes.Remove(type);
+            }
+
+            Console.WriteLine($"Removed {typesToRemove.Count} types from AOT assembly");
+
+            // Get the full names of remaining types in the module
+            var remainingTypes = new HashSet<string>();
+            foreach (var t in assembly.MainModule.Types)
+            {
+                CollectRemainingTypeNames(t, remainingTypes);
+            }
+
+            // Build set of removed type names for quick lookup
+            var removedTypeNames = new HashSet<string>(typesToRemove.Select(t => t.FullName));
+
+            // Clean up method bodies that reference removed types
+            CleanupMethodBodiesReferencingRemovedTypes(assembly, removedTypeNames, remainingTypes);
+
+            // Remove default values and custom attributes that reference types we can't resolve or were removed
+            CleanupUnresolvableDefaults(assembly, remainingTypes);
+
+            assembly.Write(_aotAssemblyPath);
+        }
+
+        /// <summary>
+        /// Modify source assembly: remove types that were moved, update references to point to AOT assembly
+        /// </summary>
+        private void ModifySourceAssembly(HashSet<string> typesToRemove)
+        {
+            var resolver = CreateResolver(Path.GetDirectoryName(_assemblyPath) ?? ".");
+
+            // Read assembly into memory to avoid file locking issues
+            // Use Deferred reading mode to avoid resolving dependencies eagerly
+            var readerParams = new ReaderParameters
+            {
+                AssemblyResolver = resolver,
+                MetadataResolver = new SafeMetadataResolver(resolver),
+                ReadingMode = ReadingMode.Deferred,
+                InMemory = true
+            };
+
+            using var assembly = AssemblyDefinition.ReadAssembly(_assemblyPath, readerParams);
+
+            // Add reference to AOT assembly
+            var aotRef = new AssemblyNameReference($"{_assemblyName}.AOT", assembly.Name.Version);
+            assembly.MainModule.AssemblyReferences.Add(aotRef);
+
+            // Update all type references that point to types now in AOT assembly
+            UpdateTypeReferences(assembly, typesToRemove, aotRef);
+
+            // Import types from AOT assembly that are still referenced
+            ImportReferencedTypes(assembly, typesToRemove, aotRef);
+
+            // Collect types to remove
+            var typesToDelete = new List<TypeDefinition>();
+            foreach (var type in assembly.MainModule.Types.ToList())
+            {
+                if (type.Name == "<Module>") continue;
+                CollectTypesToRemove(type, typesToRemove, typesToDelete, keepMatching: true);
+            }
+
+            // Remove types
+            foreach (var type in typesToDelete.Where(t => t.DeclaringType == null))
+            {
+                assembly.MainModule.Types.Remove(type);
+            }
+
+            foreach (var type in typesToDelete.Where(t => t.DeclaringType != null))
+            {
+                type.DeclaringType.NestedTypes.Remove(type);
+            }
+
+            Console.WriteLine($"Removed {typesToDelete.Count} types from source assembly");
+
+            // Get the full names of remaining types in the module
+            var remainingTypes = new HashSet<string>();
+            foreach (var t in assembly.MainModule.Types)
+            {
+                CollectRemainingTypeNames(t, remainingTypes);
+            }
+
+            // Build set of removed type names for quick lookup
+            var removedTypeNames = new HashSet<string>(typesToDelete.Select(t => t.FullName));
+
+            // Clean up method bodies that reference removed types
+            CleanupMethodBodiesReferencingRemovedTypes(assembly, removedTypeNames, remainingTypes);
+
+            // Remove default values and custom attributes that reference types we can't resolve or were removed
+            CleanupUnresolvableDefaults(assembly, remainingTypes);
+
+            assembly.Write(_assemblyPath);
+        }
+
+        /// <summary>
+        /// Import types that have been moved to the AOT assembly but are still referenced
+        /// </summary>
+        private void ImportReferencedTypes(AssemblyDefinition assembly, HashSet<string> movedTypes, AssemblyNameReference aotRef)
+        {
+            var module = assembly.MainModule;
+            
+            // Collect all type references that need to be imported
+            foreach (var type in module.Types.ToList())
+            {
+                if (type.Name == "<Module>") continue;
+                ImportReferencedTypesInType(type, movedTypes, aotRef, module);
+            }
+        }
+
+        private void ImportReferencedTypesInType(TypeDefinition type, HashSet<string> movedTypes,
+            AssemblyNameReference aotRef, ModuleDefinition module)
+        {
+            // Import generic parameter constraints
+            foreach (var genericParam in type.GenericParameters)
+            {
+                for (int i = 0; i < genericParam.Constraints.Count; i++)
+                {
+                    var constraint = genericParam.Constraints[i];
+                    if (ContainsMovedType(constraint.ConstraintType, movedTypes))
+                    {
+                        genericParam.Constraints[i] = new GenericParameterConstraint(
+                            ImportTypeReference(constraint.ConstraintType, movedTypes, aotRef, module));
+                    }
+                }
+            }
+
+            // Import base type if needed - use ContainsMovedType to catch nested generic types
+            if (type.BaseType != null && ContainsMovedType(type.BaseType, movedTypes))
+            {
+                type.BaseType = ImportTypeReference(type.BaseType, movedTypes, aotRef, module);
+            }
+
+            // Import interfaces - use ContainsMovedType to catch nested generic types
+            for (int i = 0; i < type.Interfaces.Count; i++)
+            {
+                var iface = type.Interfaces[i];
+                if (ContainsMovedType(iface.InterfaceType, movedTypes))
+                {
+                    type.Interfaces[i] = new InterfaceImplementation(
+                        ImportTypeReference(iface.InterfaceType, movedTypes, aotRef, module));
+                }
+            }
+
+            // Import field types - check for any type that contains moved types (including nested in generics)
+            foreach (var field in type.Fields)
+            {
+                if (ContainsMovedType(field.FieldType, movedTypes))
+                {
+                    field.FieldType = ImportTypeReference(field.FieldType, movedTypes, aotRef, module);
+                }
+            }
+
+            // Import method signatures - check for any type that contains moved types (including nested in generics)
+            foreach (var method in type.Methods)
+            {
+                // Import method generic parameter constraints
+                foreach (var genericParam in method.GenericParameters)
+                {
+                    for (int i = 0; i < genericParam.Constraints.Count; i++)
+                    {
+                        var constraint = genericParam.Constraints[i];
+                        if (ContainsMovedType(constraint.ConstraintType, movedTypes))
+                        {
+                            genericParam.Constraints[i] = new GenericParameterConstraint(
+                                ImportTypeReference(constraint.ConstraintType, movedTypes, aotRef, module));
+                        }
+                    }
+                }
+
+                if (ContainsMovedType(method.ReturnType, movedTypes))
+                {
+                    method.ReturnType = ImportTypeReference(method.ReturnType, movedTypes, aotRef, module);
+                }
+
+                foreach (var param in method.Parameters)
+                {
+                    if (ContainsMovedType(param.ParameterType, movedTypes))
+                    {
+                        param.ParameterType = ImportTypeReference(param.ParameterType, movedTypes, aotRef, module);
+                    }
+                }
+
+                if (method.HasBody)
+                {
+                    foreach (var variable in method.Body.Variables)
+                    {
+                        if (ContainsMovedType(variable.VariableType, movedTypes))
+                        {
+                            variable.VariableType = ImportTypeReference(variable.VariableType, movedTypes, aotRef, module);
+                        }
+                    }
+
+                    // Process instructions in method body
+                    foreach (var instruction in method.Body.Instructions)
+                    {
+                        if (instruction.Operand is TypeReference typeRef && ContainsMovedType(typeRef, movedTypes))
+                        {
+                            instruction.Operand = ImportTypeReference(typeRef, movedTypes, aotRef, module);
+                        }
+                        else if (instruction.Operand is MethodReference methodRef)
+                        {
+                            ImportMethodReference(methodRef, movedTypes, aotRef, module);
+                        }
+                        else if (instruction.Operand is FieldReference fieldRef)
+                        {
+                            ImportFieldReference(fieldRef, movedTypes, aotRef, module);
+                        }
+                    }
+                }
+            }
+
+            // Import property types - check for any type that contains moved types (including nested in generics)
+            foreach (var property in type.Properties)
+            {
+                if (ContainsMovedType(property.PropertyType, movedTypes))
+                {
+                    property.PropertyType = ImportTypeReference(property.PropertyType, movedTypes, aotRef, module);
+                }
+            }
+
+            // Import event types - check for any type that contains moved types (including nested in generics)
+            foreach (var evt in type.Events)
+            {
+                if (ContainsMovedType(evt.EventType, movedTypes))
+                {
+                    evt.EventType = ImportTypeReference(evt.EventType, movedTypes, aotRef, module);
+                }
+            }
+
+            // Import custom attributes on type
+            ImportCustomAttributes(type.CustomAttributes, movedTypes, aotRef, module);
+
+            // Import custom attributes on methods, parameters, fields, properties, events
+            foreach (var method in type.Methods)
+            {
+                ImportCustomAttributes(method.CustomAttributes, movedTypes, aotRef, module);
+                ImportCustomAttributes(method.MethodReturnType.CustomAttributes, movedTypes, aotRef, module);
+                foreach (var param in method.Parameters)
+                {
+                    ImportCustomAttributes(param.CustomAttributes, movedTypes, aotRef, module);
+                }
+            }
+            foreach (var field in type.Fields)
+            {
+                ImportCustomAttributes(field.CustomAttributes, movedTypes, aotRef, module);
+            }
+            foreach (var property in type.Properties)
+            {
+                ImportCustomAttributes(property.CustomAttributes, movedTypes, aotRef, module);
+            }
+            foreach (var evt in type.Events)
+            {
+                ImportCustomAttributes(evt.CustomAttributes, movedTypes, aotRef, module);
+            }
+
+            // Process nested types
+            foreach (var nestedType in type.NestedTypes)
+            {
+                ImportReferencedTypesInType(nestedType, movedTypes, aotRef, module);
+            }
+        }
+
+        private TypeReference ImportTypeReference(TypeReference typeRef, HashSet<string> movedTypes,
+            AssemblyNameReference aotRef, ModuleDefinition module)
+        {
+            if (typeRef == null) return null;
+
+            // Handle generic instance types - ALWAYS recreate to ensure all nested types are imported
+            if (typeRef is GenericInstanceType git)
+            {
+                var elementType = ImportTypeReference(git.ElementType, movedTypes, aotRef, module);
+                var newGit = new GenericInstanceType(elementType);
+                foreach (var arg in git.GenericArguments)
+                {
+                    // Always import each generic argument, even if not in movedTypes,
+                    // to ensure nested generic types are handled correctly
+                    newGit.GenericArguments.Add(ImportTypeReference(arg, movedTypes, aotRef, module));
+                }
+                return newGit;
+            }
+
+            // Handle arrays
+            if (typeRef is ArrayType arrayType)
+            {
+                var elementType = ImportTypeReference(arrayType.ElementType, movedTypes, aotRef, module);
+                return new ArrayType(elementType, arrayType.Rank);
+            }
+
+            // Handle by-ref types
+            if (typeRef is ByReferenceType byRefType)
+            {
+                var elementType = ImportTypeReference(byRefType.ElementType, movedTypes, aotRef, module);
+                return new ByReferenceType(elementType);
+            }
+
+            // Handle pointer types
+            if (typeRef is PointerType ptrType)
+            {
+                var elementType = ImportTypeReference(ptrType.ElementType, movedTypes, aotRef, module);
+                return new PointerType(elementType);
+            }
+
+            // Handle generic parameters - return as is
+            if (typeRef is GenericParameter)
+            {
+                return typeRef;
+            }
+
+            // Check if this type needs to be imported from AOT
+            if (movedTypes.Contains(typeRef.FullName))
+            {
+                // Create a new type reference pointing to the AOT assembly
+                var newTypeRef = new TypeReference(typeRef.Namespace, typeRef.Name, module, aotRef);
+                // Copy generic parameters if any
+                if (typeRef.HasGenericParameters)
+                {
+                    foreach (var gp in typeRef.GenericParameters)
+                    {
+                        newTypeRef.GenericParameters.Add(new GenericParameter(gp.Name, newTypeRef));
+                    }
+                }
+                return newTypeRef;
+            }
+
+            return typeRef;
+        }
+
+        private void ImportMethodReference(MethodReference methodRef, HashSet<string> movedTypes,
+            AssemblyNameReference aotRef, ModuleDefinition module)
+        {
+            if (methodRef == null) return;
+
+            // Handle generic instance methods specially - they wrap another method reference
+            if (methodRef is GenericInstanceMethod gim)
+            {
+                // Update the element method's declaring type (not the GenericInstanceMethod directly)
+                if (gim.ElementMethod != null && ShouldUpdateReference(gim.ElementMethod.DeclaringType, movedTypes))
+                {
+                    // For MethodSpecification, we need to update through ElementMethod
+                    // but ElementMethod.DeclaringType might also be read-only for some cases
+                    // So we update the generic arguments instead
+                }
+
+                // Update generic arguments
+                for (int i = 0; i < gim.GenericArguments.Count; i++)
+                {
+                    if (ShouldUpdateReference(gim.GenericArguments[i], movedTypes))
+                    {
+                        gim.GenericArguments[i] = ImportTypeReference(gim.GenericArguments[i], movedTypes, aotRef, module);
+                    }
+                }
+                return;
+            }
+
+            // For other MethodSpecification types, skip DeclaringType modification
+            if (methodRef is MethodSpecification)
+            {
+                return;
+            }
+
+            // Update declaring type only for regular method references
+            if (ShouldUpdateReference(methodRef.DeclaringType, movedTypes))
+            {
+                methodRef.DeclaringType = ImportTypeReference(methodRef.DeclaringType, movedTypes, aotRef, module);
+            }
+        }
+
+        private void ImportFieldReference(FieldReference fieldRef, HashSet<string> movedTypes,
+            AssemblyNameReference aotRef, ModuleDefinition module)
+        {
+            if (fieldRef == null) return;
+
+            // Update declaring type
+            if (ShouldUpdateReference(fieldRef.DeclaringType, movedTypes))
+            {
+                fieldRef.DeclaringType = ImportTypeReference(fieldRef.DeclaringType, movedTypes, aotRef, module);
+            }
+
+            // Update field type
+            if (ShouldUpdateReference(fieldRef.FieldType, movedTypes))
+            {
+                fieldRef.FieldType = ImportTypeReference(fieldRef.FieldType, movedTypes, aotRef, module);
+            }
+        }
+
+        /// <summary>
+        /// Import custom attributes that reference moved types
+        /// </summary>
+        private void ImportCustomAttributes(Mono.Collections.Generic.Collection<CustomAttribute> attributes,
+            HashSet<string> movedTypes, AssemblyNameReference aotRef, ModuleDefinition module)
+        {
+            foreach (var attr in attributes)
+            {
+                // Import attribute type if needed
+                if (ContainsMovedType(attr.AttributeType, movedTypes))
+                {
+                    // We need to update the constructor reference
+                    if (attr.Constructor != null && ShouldUpdateReference(attr.Constructor.DeclaringType, movedTypes))
+                    {
+                        attr.Constructor.DeclaringType = ImportTypeReference(attr.Constructor.DeclaringType, movedTypes, aotRef, module);
+                    }
+                }
+
+                // Import constructor arguments that reference moved types
+                if (attr.HasConstructorArguments)
+                {
+                    for (int i = 0; i < attr.ConstructorArguments.Count; i++)
+                    {
+                        var arg = attr.ConstructorArguments[i];
+                        if (ContainsMovedType(arg.Type, movedTypes))
+                        {
+                            var newType = ImportTypeReference(arg.Type, movedTypes, aotRef, module);
+                            attr.ConstructorArguments[i] = new CustomAttributeArgument(newType, arg.Value);
+                        }
+                        // Also handle TypeReference values
+                        if (arg.Value is TypeReference typeRefValue && ContainsMovedType(typeRefValue, movedTypes))
+                        {
+                            var newTypeValue = ImportTypeReference(typeRefValue, movedTypes, aotRef, module);
+                            attr.ConstructorArguments[i] = new CustomAttributeArgument(arg.Type, newTypeValue);
+                        }
+                    }
+                }
+
+                // Import property arguments that reference moved types
+                if (attr.HasProperties)
+                {
+                    for (int i = 0; i < attr.Properties.Count; i++)
+                    {
+                        var prop = attr.Properties[i];
+                        if (ContainsMovedType(prop.Argument.Type, movedTypes))
+                        {
+                            var newType = ImportTypeReference(prop.Argument.Type, movedTypes, aotRef, module);
+                            attr.Properties[i] = new CustomAttributeNamedArgument(
+                                prop.Name, new CustomAttributeArgument(newType, prop.Argument.Value));
+                        }
+                    }
+                }
+
+                // Import field arguments that reference moved types
+                if (attr.HasFields)
+                {
+                    for (int i = 0; i < attr.Fields.Count; i++)
+                    {
+                        var field = attr.Fields[i];
+                        if (ContainsMovedType(field.Argument.Type, movedTypes))
+                        {
+                            var newType = ImportTypeReference(field.Argument.Type, movedTypes, aotRef, module);
+                            attr.Fields[i] = new CustomAttributeNamedArgument(
+                                field.Name, new CustomAttributeArgument(newType, field.Argument.Value));
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Update type references to point to the AOT assembly for types that were moved
+        /// </summary>
+        private void UpdateTypeReferences(AssemblyDefinition assembly, HashSet<string> movedTypes, AssemblyNameReference aotRef)
+        {
+            var module = assembly.MainModule;
+
+            // Update type references in all remaining types
+            foreach (var type in module.Types)
+            {
+                if (type.Name == "<Module>") continue;
+                UpdateTypeReferencesInType(type, movedTypes, aotRef, module);
+            }
+
+            // Update member references
+            foreach (var memberRef in module.GetMemberReferences().ToList())
+            {
+                if (memberRef.DeclaringType != null && ShouldUpdateReference(memberRef.DeclaringType, movedTypes))
+                {
+                    UpdateTypeReferenceScope(memberRef.DeclaringType, aotRef);
+                }
+            }
+
+            // Update type references
+            foreach (var typeRef in module.GetTypeReferences().ToList())
+            {
+                if (ShouldUpdateReference(typeRef, movedTypes))
+                {
+                    UpdateTypeReferenceScope(typeRef, aotRef);
+                }
+            }
+        }
+
+        private void UpdateTypeReferencesInType(TypeDefinition type, HashSet<string> movedTypes, 
+            AssemblyNameReference aotRef, ModuleDefinition module)
+        {
+            // Update base type
+            if (type.BaseType != null && ShouldUpdateReference(type.BaseType, movedTypes))
+            {
+                UpdateTypeReferenceScope(type.BaseType, aotRef);
+            }
+
+            // Update interfaces
+            foreach (var iface in type.Interfaces)
+            {
+                if (ShouldUpdateReference(iface.InterfaceType, movedTypes))
+                {
+                    UpdateTypeReferenceScope(iface.InterfaceType, aotRef);
+                }
+            }
+
+            // Update fields
+            foreach (var field in type.Fields)
+            {
+                if (ShouldUpdateReference(field.FieldType, movedTypes))
+                {
+                    UpdateTypeReferenceScope(field.FieldType, aotRef);
+                }
+            }
+
+            // Update methods
+            foreach (var method in type.Methods)
+            {
+                if (ShouldUpdateReference(method.ReturnType, movedTypes))
+                {
+                    UpdateTypeReferenceScope(method.ReturnType, aotRef);
+                }
+
+                foreach (var param in method.Parameters)
+                {
+                    if (ShouldUpdateReference(param.ParameterType, movedTypes))
+                    {
+                        UpdateTypeReferenceScope(param.ParameterType, aotRef);
+                    }
+                }
+
+                if (method.HasBody)
+                {
+                    foreach (var variable in method.Body.Variables)
+                    {
+                        if (ShouldUpdateReference(variable.VariableType, movedTypes))
+                        {
+                            UpdateTypeReferenceScope(variable.VariableType, aotRef);
+                        }
+                    }
+
+                    foreach (var instruction in method.Body.Instructions)
+                    {
+                        if (instruction.Operand is TypeReference typeRef && ShouldUpdateReference(typeRef, movedTypes))
+                        {
+                            UpdateTypeReferenceScope(typeRef, aotRef);
+                        }
+                        else if (instruction.Operand is MethodReference methodRef)
+                        {
+                            if (ShouldUpdateReference(methodRef.DeclaringType, movedTypes))
+                            {
+                                UpdateTypeReferenceScope(methodRef.DeclaringType, aotRef);
+                            }
+                        }
+                        else if (instruction.Operand is FieldReference fieldRef)
+                        {
+                            if (ShouldUpdateReference(fieldRef.DeclaringType, movedTypes))
+                            {
+                                UpdateTypeReferenceScope(fieldRef.DeclaringType, aotRef);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Update properties
+            foreach (var property in type.Properties)
+            {
+                if (ShouldUpdateReference(property.PropertyType, movedTypes))
+                {
+                    UpdateTypeReferenceScope(property.PropertyType, aotRef);
+                }
+            }
+
+            // Update events
+            foreach (var evt in type.Events)
+            {
+                if (ShouldUpdateReference(evt.EventType, movedTypes))
+                {
+                    UpdateTypeReferenceScope(evt.EventType, aotRef);
+                }
+            }
+
+            // Process nested types
+            foreach (var nestedType in type.NestedTypes)
+            {
+                UpdateTypeReferencesInType(nestedType, movedTypes, aotRef, module);
+            }
+        }
+
+        private bool ShouldUpdateReference(TypeReference typeRef, HashSet<string> movedTypes)
+        {
+            if (typeRef == null) return false;
+
+            // Handle generic instance types
+            if (typeRef is GenericInstanceType git)
+            {
+                return ShouldUpdateReference(git.ElementType, movedTypes);
+            }
+
+            // Handle arrays
+            if (typeRef is ArrayType arrayType)
+            {
+                return ShouldUpdateReference(arrayType.ElementType, movedTypes);
+            }
+
+            // Handle by-ref and pointer types
+            if (typeRef is ByReferenceType byRefType)
+            {
+                return ShouldUpdateReference(byRefType.ElementType, movedTypes);
+            }
+
+            if (typeRef is PointerType ptrType)
+            {
+                return ShouldUpdateReference(ptrType.ElementType, movedTypes);
+            }
+
+            // Check if the type is in our moved types set
+            return movedTypes.Contains(typeRef.FullName);
+        }
+
+        /// <summary>
+        /// Check if a type reference contains any moved types (including in generic arguments)
+        /// </summary>
+        private bool ContainsMovedType(TypeReference typeRef, HashSet<string> movedTypes)
+        {
+            if (typeRef == null) return false;
+
+            // Handle generic instance types - check element type AND all generic arguments
+            if (typeRef is GenericInstanceType git)
+            {
+                if (ContainsMovedType(git.ElementType, movedTypes))
+                    return true;
+                foreach (var arg in git.GenericArguments)
+                {
+                    if (ContainsMovedType(arg, movedTypes))
+                        return true;
+                }
+                return false;
+            }
+
+            // Handle arrays
+            if (typeRef is ArrayType arrayType)
+            {
+                return ContainsMovedType(arrayType.ElementType, movedTypes);
+            }
+
+            // Handle by-ref and pointer types
+            if (typeRef is ByReferenceType byRefType)
+            {
+                return ContainsMovedType(byRefType.ElementType, movedTypes);
+            }
+
+            if (typeRef is PointerType ptrType)
+            {
+                return ContainsMovedType(ptrType.ElementType, movedTypes);
+            }
+
+            // Skip generic parameters
+            if (typeRef is GenericParameter) return false;
+
+            // Check if the type is in our moved types set
+            return movedTypes.Contains(typeRef.FullName);
+        }
+
+        private void UpdateTypeReferenceScope(TypeReference typeRef, AssemblyNameReference aotRef)
+        {
+            if (typeRef == null) return;
+
+            // Skip generic parameters - they don't have a settable Scope
+            if (typeRef is GenericParameter) return;
+
+            // Handle generic instance types
+            if (typeRef is GenericInstanceType git)
+            {
+                UpdateTypeReferenceScope(git.ElementType, aotRef);
+                foreach (var arg in git.GenericArguments)
+                {
+                    UpdateTypeReferenceScope(arg, aotRef);
+                }
+                return;
+            }
+
+            // Handle arrays
+            if (typeRef is ArrayType arrayType)
+            {
+                UpdateTypeReferenceScope(arrayType.ElementType, aotRef);
+                return;
+            }
+
+            // Handle by-ref types
+            if (typeRef is ByReferenceType byRefType)
+            {
+                UpdateTypeReferenceScope(byRefType.ElementType, aotRef);
+                return;
+            }
+
+            // Handle pointer types
+            if (typeRef is PointerType ptrType)
+            {
+                UpdateTypeReferenceScope(ptrType.ElementType, aotRef);
+                return;
+            }
+
+            // Update the scope to point to AOT assembly
+            typeRef.Scope = aotRef;
+        }
+
+        /// <summary>
+        /// Collect the full names of all types remaining in the module
+        /// </summary>
+        private void CollectRemainingTypeNames(TypeDefinition type, HashSet<string> typeNames)
+        {
+            typeNames.Add(type.FullName);
+            foreach (var nested in type.NestedTypes)
+            {
+                CollectRemainingTypeNames(nested, typeNames);
+            }
+        }
+
+        /// <summary>
+        /// Clean up method bodies that reference removed types
+        /// This replaces methods that reference removed types with empty implementations
+        /// </summary>
+        private void CleanupMethodBodiesReferencingRemovedTypes(AssemblyDefinition assembly, 
+            HashSet<string> removedTypeNames, HashSet<string> remainingTypes)
+        {
+            foreach (var type in assembly.MainModule.Types)
+            {
+                CleanupTypeMethodBodies(type, removedTypeNames, remainingTypes);
+            }
+        }
+
+        private void CleanupTypeMethodBodies(TypeDefinition type, HashSet<string> removedTypeNames, 
+            HashSet<string> remainingTypes)
+        {
+            foreach (var method in type.Methods)
+            {
+                if (!method.HasBody) continue;
+
+                bool needsCleanup = false;
+
+                // Check if any instruction references a removed type
+                foreach (var instruction in method.Body.Instructions)
+                {
+                    if (InstructionReferencesRemovedType(instruction, removedTypeNames, remainingTypes))
+                    {
+                        needsCleanup = true;
+                        break;
+                    }
+                }
+
+                // Also check local variables
+                if (!needsCleanup)
+                {
+                    foreach (var variable in method.Body.Variables)
+                    {
+                        if (TypeReferenceIsRemovedOrUnresolvable(variable.VariableType, removedTypeNames, remainingTypes))
+                        {
+                            needsCleanup = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (needsCleanup)
+                {
+                    // Replace method body with a simple throw NotImplementedException
+                    ClearMethodBody(method);
+                }
+            }
+
+            // Process nested types
+            foreach (var nestedType in type.NestedTypes)
+            {
+                CleanupTypeMethodBodies(nestedType, removedTypeNames, remainingTypes);
+            }
+        }
+
+        private bool InstructionReferencesRemovedType(Instruction instruction, 
+            HashSet<string> removedTypeNames, HashSet<string> remainingTypes)
+        {
+            if (instruction.Operand == null) return false;
+
+            if (instruction.Operand is TypeReference typeRef)
+            {
+                return TypeReferenceIsRemovedOrUnresolvable(typeRef, removedTypeNames, remainingTypes);
+            }
+            else if (instruction.Operand is MethodReference methodRef)
+            {
+                if (TypeReferenceIsRemovedOrUnresolvable(methodRef.DeclaringType, removedTypeNames, remainingTypes))
+                    return true;
+                if (TypeReferenceIsRemovedOrUnresolvable(methodRef.ReturnType, removedTypeNames, remainingTypes))
+                    return true;
+                foreach (var param in methodRef.Parameters)
+                {
+                    if (TypeReferenceIsRemovedOrUnresolvable(param.ParameterType, removedTypeNames, remainingTypes))
+                        return true;
+                }
+                // Check generic arguments if it's a generic instance method
+                if (methodRef is GenericInstanceMethod gim)
+                {
+                    foreach (var arg in gim.GenericArguments)
+                    {
+                        if (TypeReferenceIsRemovedOrUnresolvable(arg, removedTypeNames, remainingTypes))
+                            return true;
+                    }
+                }
+            }
+            else if (instruction.Operand is FieldReference fieldRef)
+            {
+                if (TypeReferenceIsRemovedOrUnresolvable(fieldRef.DeclaringType, removedTypeNames, remainingTypes))
+                    return true;
+                if (TypeReferenceIsRemovedOrUnresolvable(fieldRef.FieldType, removedTypeNames, remainingTypes))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private bool TypeReferenceIsRemovedOrUnresolvable(TypeReference typeRef, 
+            HashSet<string> removedTypeNames, HashSet<string> remainingTypes)
+        {
+            if (typeRef == null) return false;
+
+            // Handle generic instance types - check both element type and generic arguments
+            if (typeRef is GenericInstanceType git)
+            {
+                if (TypeReferenceIsRemovedOrUnresolvable(git.ElementType, removedTypeNames, remainingTypes))
+                    return true;
+                foreach (var arg in git.GenericArguments)
+                {
+                    if (TypeReferenceIsRemovedOrUnresolvable(arg, removedTypeNames, remainingTypes))
+                        return true;
+                }
+                return false;
+            }
+
+            // Handle arrays
+            if (typeRef is ArrayType arrayType)
+            {
+                return TypeReferenceIsRemovedOrUnresolvable(arrayType.ElementType, removedTypeNames, remainingTypes);
+            }
+
+            // Handle by-ref types
+            if (typeRef is ByReferenceType byRefType)
+            {
+                return TypeReferenceIsRemovedOrUnresolvable(byRefType.ElementType, removedTypeNames, remainingTypes);
+            }
+
+            // Handle pointer types
+            if (typeRef is PointerType ptrType)
+            {
+                return TypeReferenceIsRemovedOrUnresolvable(ptrType.ElementType, removedTypeNames, remainingTypes);
+            }
+
+            // Skip generic parameters
+            if (typeRef is GenericParameter) return false;
+
+            // Check if type was explicitly removed
+            if (removedTypeNames.Contains(typeRef.FullName))
+                return true;
+
+            // Check if it's a type from our module that no longer exists
+            if (typeRef.Scope is ModuleDefinition)
+            {
+                if (!remainingTypes.Contains(typeRef.FullName))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private void ClearMethodBody(MethodDefinition method)
+        {
+            // Clear the method body and create a minimal implementation
+            method.Body = new MethodBody(method);
+            var il = method.Body.GetILProcessor();
+            var module = method.Module;
+
+            // If the method returns void, just return
+            if (method.ReturnType.FullName == "System.Void")
+            {
+                il.Append(il.Create(OpCodes.Ret));
+            }
+            else
+            {
+                // For non-void methods, return default value or throw
+                var returnType = method.ReturnType;
+                
+                if (returnType.IsPrimitive || returnType.IsValueType)
+                {
+                    // For value types, initialize with default
+                    if (returnType.FullName == "System.Int32" || returnType.FullName == "System.Boolean" ||
+                        returnType.FullName == "System.Byte" || returnType.FullName == "System.SByte" ||
+                        returnType.FullName == "System.Int16" || returnType.FullName == "System.UInt16" ||
+                        returnType.FullName == "System.UInt32" || returnType.FullName == "System.Char")
+                    {
+                        il.Append(il.Create(OpCodes.Ldc_I4_0));
+                    }
+                    else if (returnType.FullName == "System.Int64" || returnType.FullName == "System.UInt64")
+                    {
+                        il.Append(il.Create(OpCodes.Ldc_I8, 0L));
+                    }
+                    else if (returnType.FullName == "System.Single")
+                    {
+                        il.Append(il.Create(OpCodes.Ldc_R4, 0.0f));
+                    }
+                    else if (returnType.FullName == "System.Double")
+                    {
+                        il.Append(il.Create(OpCodes.Ldc_R8, 0.0));
+                    }
+                    else
+                    {
+                        // For other value types, use a local variable
+                        var local = new VariableDefinition(returnType);
+                        method.Body.Variables.Add(local);
+                        method.Body.InitLocals = true;
+                        il.Append(il.Create(OpCodes.Ldloca_S, local));
+                        il.Append(il.Create(OpCodes.Initobj, returnType));
+                        il.Append(il.Create(OpCodes.Ldloc, local));
+                    }
+                }
+                else
+                {
+                    // For reference types, return null
+                    il.Append(il.Create(OpCodes.Ldnull));
+                }
+                
+                il.Append(il.Create(OpCodes.Ret));
+            }
+        }
+
+        /// <summary>
+        /// Clean up parameter default values that reference types we can't resolve
+        /// This prevents errors during assembly writing
+        /// </summary>
+        private void CleanupUnresolvableDefaults(AssemblyDefinition assembly, HashSet<string> remainingTypes)
+        {
+            foreach (var type in assembly.MainModule.Types)
+            {
+                CleanupTypeDefaults(type, remainingTypes);
+            }
+        }
+
+        private void CleanupTypeDefaults(TypeDefinition type, HashSet<string> remainingTypes)
+        {
+            foreach (var method in type.Methods)
+            {
+                foreach (var param in method.Parameters)
+                {
+                    if (param.HasConstant)
+                    {
+                        if (IsUnresolvableOrRemovedType(param.ParameterType, remainingTypes))
+                        {
+                            try
+                            {
+                                param.Constant = null;
+                                param.HasConstant = false;
+                            }
+                            catch
+                            {
+                                // Ignore
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Clean up field constants too
+            foreach (var field in type.Fields)
+            {
+                if (field.HasConstant)
+                {
+                    if (IsUnresolvableOrRemovedType(field.FieldType, remainingTypes))
+                    {
+                        try
+                        {
+                            field.Constant = null;
+                            field.HasConstant = false;
+                        }
+                        catch
+                        {
+                            // Ignore
+                        }
+                    }
+                }
+            }
+
+            // Clean up custom attributes with unresolvable or removed type references
+            CleanupCustomAttributes(type.CustomAttributes, remainingTypes);
+            foreach (var method in type.Methods)
+            {
+                CleanupCustomAttributes(method.CustomAttributes, remainingTypes);
+                foreach (var param in method.Parameters)
+                {
+                    CleanupCustomAttributes(param.CustomAttributes, remainingTypes);
+                }
+            }
+            foreach (var field in type.Fields)
+            {
+                CleanupCustomAttributes(field.CustomAttributes, remainingTypes);
+            }
+            foreach (var property in type.Properties)
+            {
+                CleanupCustomAttributes(property.CustomAttributes, remainingTypes);
+            }
+            foreach (var evt in type.Events)
+            {
+                CleanupCustomAttributes(evt.CustomAttributes, remainingTypes);
+            }
+
+            foreach (var nestedType in type.NestedTypes)
+            {
+                CleanupTypeDefaults(nestedType, remainingTypes);
+            }
+        }
+
+        /// <summary>
+        /// Check if a type reference is to an external type that cannot be resolved or was removed
+        /// </summary>
+        private bool IsUnresolvableOrRemovedType(TypeReference typeRef, HashSet<string> remainingTypes)
+        {
+            if (typeRef == null) return false;
+            if (typeRef is GenericParameter) return false;
+            if (typeRef.IsPrimitive) return false;
+            if (typeRef.FullName == "System.String") return false;
+            if (typeRef.FullName == "System.Object") return false;
+            if (typeRef.FullName == "System.Type") return false;
+
+            // Handle element types
+            if (typeRef is ArrayType arrayType)
+                return IsUnresolvableOrRemovedType(arrayType.ElementType, remainingTypes);
+            if (typeRef is ByReferenceType byRefType)
+                return IsUnresolvableOrRemovedType(byRefType.ElementType, remainingTypes);
+            if (typeRef is PointerType ptrType)
+                return IsUnresolvableOrRemovedType(ptrType.ElementType, remainingTypes);
+            if (typeRef is GenericInstanceType git)
+                return IsUnresolvableOrRemovedType(git.ElementType, remainingTypes);
+
+            // Check if the type was defined in this module but has been removed
+            if (typeRef.Scope is ModuleDefinition || typeRef.Scope is AssemblyNameReference asmRef && 
+                (asmRef.Name == _assemblyName || asmRef.Name == $"{_assemblyName}.AOT"))
+            {
+                // This type was from our assembly - check if it still exists
+                if (!remainingTypes.Contains(typeRef.FullName))
+                {
+                    return true; // Type was removed
+                }
+            }
+
+            try
+            {
+                var resolved = typeRef.Resolve();
+                return resolved == null;
+            }
+            catch
+            {
+                // Any exception during resolution means it's unresolvable
+                return true;
+            }
+        }
+
+        private void CleanupCustomAttributes(Mono.Collections.Generic.Collection<CustomAttribute> attributes, HashSet<string> remainingTypes)
+        {
+            // We can't easily remove individual arguments from custom attributes,
+            // but we can try to remove attributes that have unresolvable or removed types
+            var toRemove = new List<CustomAttribute>();
+            foreach (var attr in attributes)
+            {
+                try
+                {
+                    // Check if the attribute type itself was removed
+                    if (IsUnresolvableOrRemovedType(attr.AttributeType, remainingTypes))
+                    {
+                        toRemove.Add(attr);
+                        continue;
+                    }
+
+                    // Check if the constructor is null or has issues
+                    if (attr.Constructor == null)
+                    {
+                        toRemove.Add(attr);
+                        continue;
+                    }
+
+                    // Check if declaring type of constructor was removed
+                    if (attr.Constructor.DeclaringType != null && 
+                        IsUnresolvableOrRemovedType(attr.Constructor.DeclaringType, remainingTypes))
+                    {
+                        toRemove.Add(attr);
+                        continue;
+                    }
+
+                    // Try to access constructor arguments - this will trigger resolution
+                    if (attr.HasConstructorArguments)
+                    {
+                        foreach (var arg in attr.ConstructorArguments)
+                        {
+                            if (IsUnresolvableOrRemovedType(arg.Type, remainingTypes))
+                            {
+                                toRemove.Add(attr);
+                                break;
+                            }
+                            // Also check if the argument value is a TypeReference to a removed type
+                            if (arg.Value is TypeReference argTypeRef && 
+                                IsUnresolvableOrRemovedType(argTypeRef, remainingTypes))
+                            {
+                                toRemove.Add(attr);
+                                break;
+                            }
+                        }
+                    }
+
+                    // Check properties and fields of the attribute
+                    if (attr.HasProperties)
+                    {
+                        foreach (var prop in attr.Properties)
+                        {
+                            if (IsUnresolvableOrRemovedType(prop.Argument.Type, remainingTypes))
+                            {
+                                toRemove.Add(attr);
+                                break;
+                            }
+                        }
+                    }
+
+                    if (attr.HasFields)
+                    {
+                        foreach (var field in attr.Fields)
+                        {
+                            if (IsUnresolvableOrRemovedType(field.Argument.Type, remainingTypes))
+                            {
+                                toRemove.Add(attr);
+                                break;
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    // If we can't even check, mark for removal
+                    toRemove.Add(attr);
+                }
+            }
+
+            foreach (var attr in toRemove)
+            {
+                try
+                {
+                    attributes.Remove(attr);
+                }
+                catch
+                {
+                    // Ignore removal failures
+                }
+            }
+        }
+
+        private void CollectTypesToRemove(TypeDefinition type, HashSet<string> typeSet, 
+            List<TypeDefinition> result, bool keepMatching)
+        {
+            bool inSet = typeSet.Contains(type.FullName);
+            bool shouldRemove = keepMatching ? inSet : !inSet;
+
+            if (shouldRemove)
+            {
+                result.Add(type);
+            }
+            else
+            {
+                // Only process nested types if we're not removing the parent
+                foreach (var nestedType in type.NestedTypes.ToList())
+                {
+                    CollectTypesToRemove(nestedType, typeSet, result, keepMatching);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Build a dependency graph: for each type, find which other types in the same assembly it references
+        /// </summary>
+        private Dictionary<string, HashSet<string>> BuildDependencyGraph(AssemblyDefinition assembly)
+        {
+            var graph = new Dictionary<string, HashSet<string>>();
+            var allTypeNames = new HashSet<string>();
+
+            // First, collect all type names in this assembly
+            foreach (var module in assembly.Modules)
+            {
+                foreach (var type in module.Types)
+                {
+                    CollectTypeNames(type, allTypeNames);
+                }
+            }
+
+            // Build the dependency graph
+            foreach (var module in assembly.Modules)
+            {
+                foreach (var type in module.Types)
+                {
+                    BuildTypeDependencies(type, allTypeNames, graph);
+                }
+            }
+
+            return graph;
+        }
+
+        private void CollectTypeNames(TypeDefinition type, HashSet<string> typeNames)
+        {
+            if (type.Name == "<Module>") return;
+            
+            typeNames.Add(type.FullName);
+            
+            foreach (var nestedType in type.NestedTypes)
+            {
+                CollectTypeNames(nestedType, typeNames);
+            }
+        }
+
+        private void BuildTypeDependencies(TypeDefinition type, HashSet<string> allTypeNames, 
+            Dictionary<string, HashSet<string>> graph)
+        {
+            if (type.Name == "<Module>") return;
+
+            var dependencies = new HashSet<string>();
+            
+            // Check base type
+            if (type.BaseType != null)
+            {
+                AddDependencyIfInAssembly(type.BaseType, allTypeNames, dependencies);
+            }
+
+            // Check interfaces
+            foreach (var iface in type.Interfaces)
+            {
+                AddDependencyIfInAssembly(iface.InterfaceType, allTypeNames, dependencies);
+            }
+
+            // Check fields
+            foreach (var field in type.Fields)
+            {
+                AddDependencyIfInAssembly(field.FieldType, allTypeNames, dependencies);
+            }
+
+            // Check properties
+            foreach (var property in type.Properties)
+            {
+                AddDependencyIfInAssembly(property.PropertyType, allTypeNames, dependencies);
+            }
+
+            // Check methods
+            foreach (var method in type.Methods)
+            {
+                AddDependencyIfInAssembly(method.ReturnType, allTypeNames, dependencies);
+                
+                foreach (var param in method.Parameters)
+                {
+                    AddDependencyIfInAssembly(param.ParameterType, allTypeNames, dependencies);
+                }
+
+                if (method.HasBody)
+                {
+                    foreach (var variable in method.Body.Variables)
+                    {
+                        AddDependencyIfInAssembly(variable.VariableType, allTypeNames, dependencies);
+                    }
+
+                    foreach (var instruction in method.Body.Instructions)
+                    {
+                        if (instruction.Operand is TypeReference typeRef)
+                        {
+                            AddDependencyIfInAssembly(typeRef, allTypeNames, dependencies);
+                        }
+                        else if (instruction.Operand is MethodReference methodRef)
+                        {
+                            AddDependencyIfInAssembly(methodRef.DeclaringType, allTypeNames, dependencies);
+                            AddDependencyIfInAssembly(methodRef.ReturnType, allTypeNames, dependencies);
+                            foreach (var param in methodRef.Parameters)
+                            {
+                                AddDependencyIfInAssembly(param.ParameterType, allTypeNames, dependencies);
+                            }
+                        }
+                        else if (instruction.Operand is FieldReference fieldRef)
+                        {
+                            AddDependencyIfInAssembly(fieldRef.DeclaringType, allTypeNames, dependencies);
+                            AddDependencyIfInAssembly(fieldRef.FieldType, allTypeNames, dependencies);
+                        }
+                    }
+                }
+            }
+
+            // Check custom attributes
+            foreach (var attr in type.CustomAttributes)
+            {
+                AddDependencyIfInAssembly(attr.AttributeType, allTypeNames, dependencies);
+            }
+
+            // Check generic parameters
+            foreach (var genericParam in type.GenericParameters)
+            {
+                foreach (var constraint in genericParam.Constraints)
+                {
+                    AddDependencyIfInAssembly(constraint.ConstraintType, allTypeNames, dependencies);
+                }
+            }
+
+            // Remove self-reference
+            dependencies.Remove(type.FullName);
+            
+            graph[type.FullName] = dependencies;
+
+            // Process nested types
+            foreach (var nestedType in type.NestedTypes)
+            {
+                BuildTypeDependencies(nestedType, allTypeNames, graph);
+            }
+        }
+
+        private void AddDependencyIfInAssembly(TypeReference typeRef, HashSet<string> allTypeNames, 
+            HashSet<string> dependencies)
+        {
+            if (typeRef == null) return;
+
+            // Handle generic instances
+            if (typeRef is GenericInstanceType genericType)
+            {
+                AddDependencyIfInAssembly(genericType.ElementType, allTypeNames, dependencies);
+                foreach (var arg in genericType.GenericArguments)
+                {
+                    AddDependencyIfInAssembly(arg, allTypeNames, dependencies);
+                }
+                return;
+            }
+
+            // Handle arrays
+            if (typeRef is ArrayType arrayType)
+            {
+                AddDependencyIfInAssembly(arrayType.ElementType, allTypeNames, dependencies);
+                return;
+            }
+
+            // Handle by-ref and pointer types
+            if (typeRef is ByReferenceType byRefType)
+            {
+                AddDependencyIfInAssembly(byRefType.ElementType, allTypeNames, dependencies);
+                return;
+            }
+
+            if (typeRef is PointerType ptrType)
+            {
+                AddDependencyIfInAssembly(ptrType.ElementType, allTypeNames, dependencies);
+                return;
+            }
+
+            // Check if the type is in our assembly
+            string fullName = typeRef.FullName;
+            if (allTypeNames.Contains(fullName))
+            {
+                dependencies.Add(fullName);
+            }
+        }
+
+        /// <summary>
+        /// Calculate depth for each type. Depth 1 = leaf nodes (no dependencies on other types in assembly)
+        /// </summary>
+        private Dictionary<string, int> CalculateTypeDepths(Dictionary<string, HashSet<string>> dependencyGraph)
+        {
+            var depths = new Dictionary<string, int>();
+            var visited = new HashSet<string>();
+            var visiting = new HashSet<string>();
+
+            foreach (var typeName in dependencyGraph.Keys)
+            {
+                if (!depths.ContainsKey(typeName))
+                {
+                    CalculateDepthDFS(typeName, dependencyGraph, depths, visited, visiting);
+                }
+            }
+
+            return depths;
+        }
+
+        private int CalculateDepthDFS(string typeName, Dictionary<string, HashSet<string>> graph,
+            Dictionary<string, int> depths, HashSet<string> visited, HashSet<string> visiting)
+        {
+            if (depths.TryGetValue(typeName, out int cachedDepth))
+            {
+                return cachedDepth;
+            }
+
+            // Detect circular dependency
+            if (visiting.Contains(typeName))
+            {
+                // For circular dependencies, we treat them as depth 1 (they form a cycle)
+                return 1;
+            }
+
+            visiting.Add(typeName);
+
+            if (!graph.TryGetValue(typeName, out var dependencies) || dependencies.Count == 0)
+            {
+                // Leaf node - no dependencies
+                depths[typeName] = 1;
+            }
+            else
+            {
+                int maxDependencyDepth = 0;
+                foreach (var dep in dependencies)
+                {
+                    if (graph.ContainsKey(dep))
+                    {
+                        int depDepth = CalculateDepthDFS(dep, graph, depths, visited, visiting);
+                        maxDependencyDepth = Math.Max(maxDependencyDepth, depDepth);
+                    }
+                }
+                depths[typeName] = maxDependencyDepth + 1;
+            }
+
+            visiting.Remove(typeName);
+            visited.Add(typeName);
+
+            return depths[typeName];
+        }
+    }
+}
