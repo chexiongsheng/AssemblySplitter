@@ -114,12 +114,12 @@ namespace AssemblySplitter
             }
         }
 
-        private void AddSearchDirectorys(BaseAssemblyResolver resolver, string baseDirectory)
+        private DefaultAssemblyResolver CreateResolver(string baseDirectory)
         {
-            if (resolver == null) return;
+            var resolver = new DefaultAssemblyResolver();
             resolver.AddSearchDirectory(baseDirectory);
             Console.WriteLine($"  Added search directory: {baseDirectory}");
-            
+
             // Add user-specified search directories
             foreach (var dir in _searchDirectories)
             {
@@ -129,6 +129,8 @@ namespace AssemblySplitter
                     Console.WriteLine($"  Added search directory: {dir}");
                 }
             }
+
+            return resolver;
         }
 
         public void Split()
@@ -147,11 +149,11 @@ namespace AssemblySplitter
             HashSet<string> typesToMoveToAot;
             var analysisReaderParams = new ReaderParameters
             {
-                ReadingMode = ReadingMode.Deferred  // Deferred mode to avoid resolving all dependencies upfront
+                ReadingMode = ReadingMode.Immediate,
+                AssemblyResolver = CreateResolver(Path.GetDirectoryName(_assemblyPath) ?? "."),
             };
             using (var assembly = AssemblyDefinition.ReadAssembly(_assemblyPath, analysisReaderParams))
             {
-                AddSearchDirectorys(assembly.MainModule.AssemblyResolver as BaseAssemblyResolver, Path.GetDirectoryName(_aotAssemblyPath) ?? ".");
                 var dependencyGraph = BuildDependencyGraph(assembly);
                 var typeDepths = CalculateTypeDepths(dependencyGraph);
                 
@@ -196,13 +198,12 @@ namespace AssemblySplitter
             // Use Deferred reading mode to avoid resolving dependencies eagerly
             var readerParams = new ReaderParameters
             {
-                ReadingMode = ReadingMode.Deferred,
-                InMemory = true
+                ReadingMode = ReadingMode.Immediate,
+                InMemory = true,
+                AssemblyResolver = CreateResolver(Path.GetDirectoryName(_assemblyPath) ?? "."),
             };
 
             using var assembly = AssemblyDefinition.ReadAssembly(_aotAssemblyPath, readerParams);
-
-            AddSearchDirectorys(assembly.MainModule.AssemblyResolver as BaseAssemblyResolver, Path.GetDirectoryName(_aotAssemblyPath) ?? ".");
 
             // Change assembly name
             assembly.Name.Name = $"{_assemblyName}.AOT";
@@ -237,13 +238,12 @@ namespace AssemblySplitter
             // Use Deferred reading mode to avoid resolving dependencies eagerly
             var readerParams = new ReaderParameters
             {
-                ReadingMode = ReadingMode.Deferred,
-                InMemory = true
+                ReadingMode = ReadingMode.Immediate,
+                InMemory = true,
+                AssemblyResolver = CreateResolver(Path.GetDirectoryName(_assemblyPath) ?? "."),
             };
 
             using var assembly = AssemblyDefinition.ReadAssembly(_assemblyPath, readerParams);
-
-            AddSearchDirectorys(assembly.MainModule.AssemblyResolver as BaseAssemblyResolver, Path.GetDirectoryName(_aotAssemblyPath) ?? ".");
 
             // Add reference to AOT assembly
             var aotRef = new AssemblyNameReference($"{_assemblyName}.AOT", assembly.Name.Version);
