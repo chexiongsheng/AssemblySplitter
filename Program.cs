@@ -222,12 +222,6 @@ namespace AssemblySplitter
                 assembly.MainModule.Types.Remove(type);
             }
 
-            // Also handle nested types
-            foreach (var type in typesToRemove.Where(t => t.DeclaringType != null))
-            {
-                type.DeclaringType.NestedTypes.Remove(type);
-            }
-
             Console.WriteLine($"Removed {typesToRemove.Count} types from AOT assembly");
 
             assembly.Write(_aotAssemblyPath);
@@ -272,11 +266,6 @@ namespace AssemblySplitter
             foreach (var type in typesToDelete.Where(t => t.DeclaringType == null))
             {
                 assembly.MainModule.Types.Remove(type);
-            }
-
-            foreach (var type in typesToDelete.Where(t => t.DeclaringType != null))
-            {
-                type.DeclaringType.NestedTypes.Remove(type);
             }
 
             Console.WriteLine($"Removed {typesToDelete.Count} types from source assembly");
@@ -919,14 +908,6 @@ namespace AssemblySplitter
             if (shouldRemove)
             {
                 result.Add(type);
-            }
-            else
-            {
-                // Only process nested types if we're not removing the parent
-                foreach (var nestedType in type.NestedTypes.ToList())
-                {
-                    CollectTypesToRemove(nestedType, typeSet, result, keepMatching);
-                }
             }
         }
 
