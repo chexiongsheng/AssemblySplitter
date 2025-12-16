@@ -994,12 +994,20 @@ namespace AssemblySplitter
             foreach (var field in type.Fields)
             {
                 AddDependencyIfInAssembly(field.FieldType, allTypeNames, dependencies);
+                foreach (var attr in field.CustomAttributes)
+                {
+                    AddDependencyIfInAssembly(attr.AttributeType, allTypeNames, dependencies);
+                }
             }
 
             // Check properties
             foreach (var property in type.Properties)
             {
                 AddDependencyIfInAssembly(property.PropertyType, allTypeNames, dependencies);
+                foreach (var attr in property.CustomAttributes)
+                {
+                    AddDependencyIfInAssembly(attr.AttributeType, allTypeNames, dependencies);
+                }
             }
 
             // Check methods
@@ -1010,6 +1018,10 @@ namespace AssemblySplitter
                 foreach (var param in method.Parameters)
                 {
                     AddDependencyIfInAssembly(param.ParameterType, allTypeNames, dependencies);
+                }
+                foreach (var attr in method.CustomAttributes)
+                {
+                    AddDependencyIfInAssembly(attr.AttributeType, allTypeNames, dependencies);
                 }
 
                 if (method.HasBody)
