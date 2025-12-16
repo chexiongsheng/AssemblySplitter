@@ -1045,6 +1045,14 @@ namespace AssemblySplitter
                             {
                                 AddDependencyIfInAssembly(param.ParameterType, allTypeNames, dependencies);
                             }
+                            var genericMethod = methodRef as GenericInstanceMethod;
+                            if (genericMethod != null)
+                            {
+                                foreach (var arg in genericMethod.GenericArguments)
+                                {
+                                    AddDependencyIfInAssembly(arg, allTypeNames, dependencies);
+                                }
+                            }
                         }
                         else if (instruction.Operand is FieldReference fieldRef)
                         {
