@@ -114,25 +114,6 @@ namespace AssemblySplitter
             }
         }
 
-        /// <summary>
-        /// Remove backup file after successful operation
-        /// </summary>
-        public void CleanupBackup()
-        {
-            try
-            {
-                if (File.Exists(_backupPath))
-                {
-                    File.Delete(_backupPath);
-                    Console.WriteLine($"Removed backup: {_backupPath}");
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Warning: Could not remove backup: {ex.Message}");
-            }
-        }
-
         private void AddSearchDirectorys(BaseAssemblyResolver resolver, string baseDirectory)
         {
             if (resolver == null) return;
