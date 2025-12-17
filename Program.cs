@@ -360,6 +360,20 @@ namespace AssemblySplitter
                     }
                 }
 
+                // Import method overrides (interface implementations, explicit overrides)
+                if (method.HasOverrides)
+                {
+                    for (int i = 0; i < method.Overrides.Count; i++)
+                    {
+                        var overrideMethod = method.Overrides[i];
+                        var newOverrideMethod = ImportMethodReference(overrideMethod, movedTypes, aotRef, module);
+                        if (newOverrideMethod != overrideMethod)
+                        {
+                            method.Overrides[i] = newOverrideMethod;
+                        }
+                    }
+                }
+
                 if (method.HasBody)
                 {
                     foreach (var variable in method.Body.Variables)
