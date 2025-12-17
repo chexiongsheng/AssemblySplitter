@@ -250,9 +250,6 @@ namespace AssemblySplitter
             var aotRef = new AssemblyNameReference($"{_assemblyName}.AOT", assembly.Name.Version);
             assembly.MainModule.AssemblyReferences.Add(aotRef);
 
-            // Update all type references that point to types now in AOT assembly
-            UpdateTypeReferences(assembly, typesToRemove, aotRef);
-
             // Import types from AOT assembly that are still referenced
             ImportReferencedTypes(assembly, typesToRemove, aotRef);
 
@@ -382,19 +379,19 @@ namespace AssemblySplitter
                         }
                         else if (instruction.Operand is MethodReference methodRef)
                         {
-                            ImportMethodReference(methodRef, movedTypes, aotRef, module);
-                            var genericMethod = methodRef as GenericInstanceMethod;
-                            if (genericMethod != null)
+                            var newMethodRef = ImportMethodReference(methodRef, movedTypes, aotRef, module);
+                            if (newMethodRef != methodRef)
                             {
-                                foreach (var arg in genericMethod.GenericArguments)
-                                {
-                                    ImportTypeReference(arg, movedTypes, aotRef, module);
-                                }
+                                instruction.Operand = newMethodRef;
                             }
                         }
                         else if (instruction.Operand is FieldReference fieldRef)
                         {
-                            ImportFieldReference(fieldRef, movedTypes, aotRef, module);
+                            var newFieldRef = ImportFieldReference(fieldRef, movedTypes, aotRef, module);
+                            if (newFieldRef != fieldRef)
+                            {
+                                instruction.Operand = newFieldRef;
+                            }
                         }
                     }
                 }
@@ -516,62 +513,121 @@ namespace AssemblySplitter
             return typeRef;
         }
 
-        private void ImportMethodReference(MethodReference methodRef, HashSet<string> movedTypes,
+        private MethodReference ImportMethodReference(MethodReference methodRef, HashSet<string> movedTypes,
             AssemblyNameReference aotRef, ModuleDefinition module)
         {
-            if (methodRef == null) return;
+            if (methodRef == null) return null;
 
-            // Handle generic instance methods specially - they wrap another method reference
-            if (methodRef is GenericInstanceMethod gim)
+            // Check if we need to update this method reference
+            bool needsUpdate = ContainsMovedType(methodRef.DeclaringType, movedTypes);
+            
+            // Check return type and parameters
+            if (!needsUpdate)
             {
-                // Update the element method's declaring type (not the GenericInstanceMethod directly)
-                if (gim.ElementMethod != null && ContainsMovedType(gim.ElementMethod.DeclaringType, movedTypes))
+                if (ContainsMovedType(methodRef.ReturnType, movedTypes))
+                    needsUpdate = true;
+                else
                 {
-                    // For MethodSpecification, we need to update through ElementMethod
-                    // but ElementMethod.DeclaringType might also be read-only for some cases
-                    // So we update the generic arguments instead
-                }
-
-                // Update generic arguments
-                for (int i = 0; i < gim.GenericArguments.Count; i++)
-                {
-                    if (ContainsMovedType(gim.GenericArguments[i], movedTypes))
+                    foreach (var param in methodRef.Parameters)
                     {
-                        gim.GenericArguments[i] = ImportTypeReference(gim.GenericArguments[i], movedTypes, aotRef, module);
+                        if (ContainsMovedType(param.ParameterType, movedTypes))
+                        {
+                            needsUpdate = true;
+                            break;
+                        }
                     }
                 }
-                return;
             }
 
-            // For other MethodSpecification types, skip DeclaringType modification
+            // Handle generic instance methods
+            if (methodRef is GenericInstanceMethod gim)
+            {
+                // Check if any generic arguments need updating
+                bool hasMovedGenericArgs = false;
+                foreach (var arg in gim.GenericArguments)
+                {
+                    if (ContainsMovedType(arg, movedTypes))
+                    {
+                        hasMovedGenericArgs = true;
+                        break;
+                    }
+                }
+
+                if (needsUpdate || hasMovedGenericArgs)
+                {
+                    // Import the element method first
+                    var newElementMethod = ImportMethodReference(gim.ElementMethod, movedTypes, aotRef, module);
+                    var newGim = new GenericInstanceMethod(newElementMethod);
+                    
+                    // Import generic arguments
+                    foreach (var arg in gim.GenericArguments)
+                    {
+                        newGim.GenericArguments.Add(ImportTypeReference(arg, movedTypes, aotRef, module));
+                    }
+                    
+                    return newGim;
+                }
+                return methodRef;
+            }
+
+            // For other MethodSpecification types, return as-is for now
             if (methodRef is MethodSpecification)
             {
-                return;
+                return methodRef;
             }
 
-            // Update declaring type only for regular method references
-            if (ContainsMovedType(methodRef.DeclaringType, movedTypes))
+            // For regular method references, create a new one if needed
+            if (needsUpdate)
             {
-                methodRef.DeclaringType = ImportTypeReference(methodRef.DeclaringType, movedTypes, aotRef, module);
+                var newDeclaringType = ImportTypeReference(methodRef.DeclaringType, movedTypes, aotRef, module);
+                var newMethodRef = new MethodReference(methodRef.Name, methodRef.ReturnType, newDeclaringType)
+                {
+                    HasThis = methodRef.HasThis,
+                    ExplicitThis = methodRef.ExplicitThis,
+                    CallingConvention = methodRef.CallingConvention
+                };
+
+                // Copy generic parameters
+                foreach (var gp in methodRef.GenericParameters)
+                {
+                    newMethodRef.GenericParameters.Add(new GenericParameter(gp.Name, newMethodRef));
+                }
+
+                // Import return type
+                newMethodRef.ReturnType = ImportTypeReference(methodRef.ReturnType, movedTypes, aotRef, module);
+
+                // Copy and import parameters
+                foreach (var param in methodRef.Parameters)
+                {
+                    var newParam = new ParameterDefinition(param.Name, param.Attributes,
+                        ImportTypeReference(param.ParameterType, movedTypes, aotRef, module));
+                    newMethodRef.Parameters.Add(newParam);
+                }
+
+                return newMethodRef;
             }
+
+            return methodRef;
         }
 
-        private void ImportFieldReference(FieldReference fieldRef, HashSet<string> movedTypes,
+        private FieldReference ImportFieldReference(FieldReference fieldRef, HashSet<string> movedTypes,
             AssemblyNameReference aotRef, ModuleDefinition module)
         {
-            if (fieldRef == null) return;
+            if (fieldRef == null) return null;
 
-            // Update declaring type
-            if (ContainsMovedType(fieldRef.DeclaringType, movedTypes))
+            // Check if we need to update this field reference
+            bool needsUpdate = ContainsMovedType(fieldRef.DeclaringType, movedTypes) ||
+                               ContainsMovedType(fieldRef.FieldType, movedTypes);
+
+            if (needsUpdate)
             {
-                fieldRef.DeclaringType = ImportTypeReference(fieldRef.DeclaringType, movedTypes, aotRef, module);
+                var newDeclaringType = ImportTypeReference(fieldRef.DeclaringType, movedTypes, aotRef, module);
+                var newFieldType = ImportTypeReference(fieldRef.FieldType, movedTypes, aotRef, module);
+                var newFieldRef = new FieldReference(fieldRef.Name, newFieldType, newDeclaringType);
+                return newFieldRef;
             }
 
-            // Update field type
-            if (ContainsMovedType(fieldRef.FieldType, movedTypes))
-            {
-                fieldRef.FieldType = ImportTypeReference(fieldRef.FieldType, movedTypes, aotRef, module);
-            }
+            return fieldRef;
         }
 
         /// <summary>
@@ -645,128 +701,6 @@ namespace AssemblySplitter
         }
 
         /// <summary>
-        /// Update type references to point to the AOT assembly for types that were moved
-        /// </summary>
-        private void UpdateTypeReferences(AssemblyDefinition assembly, HashSet<string> movedTypes, AssemblyNameReference aotRef)
-        {
-            var module = assembly.MainModule;
-
-            // Update type references in all remaining types
-            foreach (var type in module.Types)
-            {
-                if (type.Name == "<Module>") continue;
-                UpdateTypeReferencesInType(type, movedTypes, aotRef, module);
-            }
-
-            // Update member references
-            foreach (var memberRef in module.GetMemberReferences().ToList())
-            {
-                if (memberRef.DeclaringType != null)
-                {
-                    UpdateTypeReferenceScope(memberRef.DeclaringType, movedTypes, aotRef);
-                }
-            }
-
-            // Update type references
-            foreach (var typeRef in module.GetTypeReferences().ToList())
-            {
-                UpdateTypeReferenceScope(typeRef, movedTypes, aotRef);
-            }
-        }
-
-        private void UpdateTypeReferencesInType(TypeDefinition type, HashSet<string> movedTypes, 
-            AssemblyNameReference aotRef, ModuleDefinition module)
-        {
-            // Update base type
-            if (type.BaseType != null)
-            {
-                UpdateTypeReferenceScope(type.BaseType, movedTypes, aotRef);
-            }
-
-            // Update interfaces
-            foreach (var iface in type.Interfaces)
-            {
-                UpdateTypeReferenceScope(iface.InterfaceType, movedTypes, aotRef);
-            }
-
-            // Update fields
-            foreach (var field in type.Fields)
-            {
-                UpdateTypeReferenceScope(field.FieldType, movedTypes, aotRef);
-            }
-
-            // Update methods
-            foreach (var method in type.Methods)
-            {
-                UpdateTypeReferenceScope(method.DeclaringType, movedTypes, aotRef);
-                UpdateTypeReferenceScope(method.ReturnType, movedTypes, aotRef);
-
-                foreach (var param in method.Parameters)
-                {
-                    UpdateTypeReferenceScope(param.ParameterType, movedTypes, aotRef);
-                }
-
-                if (method.HasBody)
-                {
-                    foreach (var variable in method.Body.Variables)
-                    {
-                        UpdateTypeReferenceScope(variable.VariableType, movedTypes, aotRef);
-                    }
-
-                    foreach (var instruction in method.Body.Instructions)
-                    {
-                        if (instruction.Operand is TypeReference typeRef)
-                        {
-                            UpdateTypeReferenceScope(typeRef, movedTypes, aotRef);
-                        }
-                        else if (instruction.Operand is MethodReference methodRef)
-                        {
-                            UpdateTypeReferenceScope(methodRef.DeclaringType, movedTypes, aotRef);
-                            var genericMethod = methodRef as GenericInstanceMethod;
-                            if (genericMethod != null)
-                            {
-                                foreach (var arg in genericMethod.GenericArguments)
-                                {
-                                    UpdateTypeReferenceScope(arg, movedTypes, aotRef);
-                                }
-                            }
-                        }
-                        else if (instruction.Operand is FieldReference fieldRef)
-                        {
-                            UpdateTypeReferenceScope(fieldRef.DeclaringType, movedTypes, aotRef);
-                        }
-                    }
-                }
-            }
-
-            foreach (var genericParam in type.GenericParameters)
-            {
-                foreach (var constraint in genericParam.Constraints)
-                {
-                    UpdateTypeReferenceScope(constraint.ConstraintType, movedTypes, aotRef);
-                }
-            }
-
-            // Update properties
-            foreach (var property in type.Properties)
-            {
-                UpdateTypeReferenceScope(property.PropertyType, movedTypes, aotRef);
-            }
-
-            // Update events
-            foreach (var evt in type.Events)
-            {
-                UpdateTypeReferenceScope(evt.EventType, movedTypes, aotRef);
-            }
-
-            // Process nested types
-            foreach (var nestedType in type.NestedTypes)
-            {
-                UpdateTypeReferencesInType(nestedType, movedTypes, aotRef, module);
-            }
-        }
-
-        /// <summary>
         /// Check if a type reference contains any moved types (including in generic arguments)
         /// </summary>
         private bool ContainsMovedType(TypeReference typeRef, HashSet<string> movedTypes)
@@ -808,51 +742,6 @@ namespace AssemblySplitter
 
             // Check if the type is in our moved types set
             return movedTypes.Contains(typeRef.FullName);
-        }
-
-        private void UpdateTypeReferenceScope(TypeReference typeRef, HashSet<string> movedTypes, AssemblyNameReference aotRef)
-        {
-            if (typeRef == null) return;
-
-            // Skip generic parameters - they don't have a settable Scope
-            if (typeRef is GenericParameter) return;
-
-            // Handle generic instance types
-            if (typeRef is GenericInstanceType git)
-            {
-                UpdateTypeReferenceScope(git.ElementType, movedTypes, aotRef);
-                foreach (var arg in git.GenericArguments)
-                {
-                    UpdateTypeReferenceScope(arg, movedTypes, aotRef);
-                }
-                return;
-            }
-
-            // Handle arrays
-            if (typeRef is ArrayType arrayType)
-            {
-                UpdateTypeReferenceScope(arrayType.ElementType, movedTypes, aotRef);
-                return;
-            }
-
-            // Handle by-ref types
-            if (typeRef is ByReferenceType byRefType)
-            {
-                UpdateTypeReferenceScope(byRefType.ElementType, movedTypes, aotRef);
-                return;
-            }
-
-            // Handle pointer types
-            if (typeRef is PointerType ptrType)
-            {
-                UpdateTypeReferenceScope(ptrType.ElementType, movedTypes, aotRef);
-                return;
-            }
-
-            if (movedTypes.Contains(typeRef.FullName))
-            {
-                typeRef.Scope = aotRef;
-            }
         }
 
         /// <summary>
