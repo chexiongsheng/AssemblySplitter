@@ -160,6 +160,7 @@ namespace AssemblySplitter
                 typesToMoveToAot = typeDepths
                     .Where(kvp => kvp.Value <= _depth)
                     .Select(kvp => kvp.Key)
+                    .Where(name => !name.Contains('/')) // Exclude nested types
                     .ToHashSet();
 
                 if (typesToMoveToAot.Count == 0)
