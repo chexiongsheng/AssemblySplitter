@@ -12,17 +12,18 @@ namespace AssemblySplitter
         {
             if (args.Length < 2)
             {
-                Console.WriteLine("Usage: AssemblySplitter <assembly_path> <depth> [search_directories]");
+                Console.WriteLine("Usage: AssemblySplitter <assembly_path> <depth> [search_directories] [type_names]");
                 Console.WriteLine("  assembly_path: Path to the assembly to split (e.g., Scripts.GameCore.dll)");
-                Console.WriteLine("  depth: Depth parameter (must be >= 1)");
+                Console.WriteLine("  depth: Depth parameter (must be >= 1), or 0 to use type_names only");
                 Console.WriteLine("  search_directories: Optional, semicolon-separated list of directories to search for dependencies");
+                Console.WriteLine("  type_names: Optional, semicolon-separated list of type names to move (with their dependencies)");
                 return;
             }
 
             string assemblyPath = args[0];
-            if (!int.TryParse(args[1], out int depth) || depth < 1)
+            if (!int.TryParse(args[1], out int depth) || depth < 0)
             {
-                Console.WriteLine("Error: Depth must be an integer >= 1");
+                Console.WriteLine("Error: Depth must be an integer >= 0");
                 return;
             }
 
@@ -39,7 +40,14 @@ namespace AssemblySplitter
                 searchDirectories.AddRange(args[2].Split(';', StringSplitOptions.RemoveEmptyEntries));
             }
 
-            var splitter = new AssemblySplitter(assemblyPath, depth, searchDirectories);
+            // Parse optional type names
+            var typeNames = new List<string>();
+            if (args.Length >= 4)
+            {
+                typeNames.AddRange(args[3].Split(';', StringSplitOptions.RemoveEmptyEntries));
+            }
+
+            var splitter = new AssemblySplitter(assemblyPath, depth, searchDirectories, typeNames);
             try
             {
                 splitter.Split();
@@ -69,13 +77,15 @@ namespace AssemblySplitter
         private readonly string _assemblyName;
         private readonly string _backupPath;
         private readonly List<string> _searchDirectories;
+        private readonly List<string> _specifiedTypeNames;
 
-        public AssemblySplitter(string assemblyPath, int depth, List<string> searchDirectories = null)
+        public AssemblySplitter(string assemblyPath, int depth, List<string> searchDirectories = null, List<string> specifiedTypeNames = null)
         {
             _assemblyPath = Path.GetFullPath(assemblyPath);
             _depth = depth;
             _assemblyName = Path.GetFileNameWithoutExtension(assemblyPath);
             _searchDirectories = searchDirectories ?? new List<string>();
+            _specifiedTypeNames = specifiedTypeNames ?? new List<string>();
             
             string directory = Path.GetDirectoryName(_assemblyPath) ?? ".";
             _aotAssemblyPath = Path.Combine(directory, $"{_assemblyName}.AOT.dll");
@@ -157,22 +167,56 @@ namespace AssemblySplitter
                 var dependencyGraph = BuildDependencyGraph(assembly);
                 var typeDepths = CalculateTypeDepths(dependencyGraph);
                 
-                typesToMoveToAot = typeDepths
-                    .Where(kvp => kvp.Value <= _depth)
-                    .Select(kvp => kvp.Key)
-                    .Where(name => !name.Contains('/')) // Exclude nested types
-                    .ToHashSet();
+                typesToMoveToAot = new HashSet<string>();
+                
+                // Add types from depth-based selection if depth > 0
+                if (_depth > 0)
+                {
+                    var depthBasedTypes = typeDepths
+                        .Where(kvp => kvp.Value <= _depth)
+                        .Select(kvp => kvp.Key)
+                        .Where(name => !name.Contains('/')) // Exclude nested types
+                        .ToHashSet();
 
+                    foreach (var type in depthBasedTypes)
+                    {
+                        typesToMoveToAot.Add(type);
+                    }
+
+                    Console.WriteLine($"\nTypes selected by depth <= {_depth}: {depthBasedTypes.Count} types");
+                }
+                
+                // Add types from specified type names if provided
+                if (_specifiedTypeNames.Count > 0)
+                {
+                    Console.WriteLine($"\nSpecified type names ({_specifiedTypeNames.Count} types):");
+                    foreach (var typeName in _specifiedTypeNames)
+                    {
+                        Console.WriteLine($"  {typeName}");
+                    }
+                    
+                    var specifiedTypes = CollectTypesAndDependencies(_specifiedTypeNames, dependencyGraph, assembly);
+                    
+                    Console.WriteLine($"\nTypes from specified names (including dependencies): {specifiedTypes.Count} types");
+                    
+                    foreach (var type in specifiedTypes)
+                    {
+                        typesToMoveToAot.Add(type);
+                    }
+                }
+                
+                // Check if we have any types to move
                 if (typesToMoveToAot.Count == 0)
                 {
-                    Console.WriteLine("No types found to move at the specified depth.");
+                    Console.WriteLine("\nError: No types to move. Either specify depth > 0 or provide type names.");
                     return;
                 }
 
-                Console.WriteLine($"\nTypes to move to AOT assembly ({typesToMoveToAot.Count} types):");
-                foreach (var type in typesToMoveToAot.OrderBy(t => typeDepths[t]).ThenBy(t => t))
+                Console.WriteLine($"\nTotal types to move to AOT assembly: {typesToMoveToAot.Count} types");
+                foreach (var type in typesToMoveToAot.OrderBy(t => typeDepths.ContainsKey(t) ? typeDepths[t] : 0).ThenBy(t => t))
                 {
-                    Console.WriteLine($"  [Depth {typeDepths[type]}] {type}");
+                    var depthStr = typeDepths.ContainsKey(type) ? $"Depth {typeDepths[type]}" : "N/A";
+                    Console.WriteLine($"  [{depthStr}] {type}");
                 }
             }
 
@@ -1051,6 +1095,77 @@ namespace AssemblySplitter
             visited.Add(typeName);
 
             return depths[typeName];
+        }
+
+        /// <summary>
+        /// Collect specified types and all their dependencies (recursively)
+        /// </summary>
+        private HashSet<string> CollectTypesAndDependencies(List<string> specifiedTypeNames, 
+            Dictionary<string, HashSet<string>> dependencyGraph, AssemblyDefinition assembly)
+        {
+            var result = new HashSet<string>();
+            var allTypeNames = new HashSet<string>(dependencyGraph.Keys);
+            var queue = new Queue<string>();
+            
+            // Normalize specified type names and find matches
+            foreach (var specifiedName in specifiedTypeNames)
+            {
+                // Try exact match first
+                if (allTypeNames.Contains(specifiedName))
+                {
+                    queue.Enqueue(specifiedName);
+                    result.Add(specifiedName);
+                }
+                else
+                {
+                    // Try to find by simple name (without namespace)
+                    var matches = allTypeNames.Where(t => 
+                        t.EndsWith("." + specifiedName) || 
+                        t == specifiedName ||
+                        t.EndsWith("/" + specifiedName)).ToList();
+                    
+                    if (matches.Count == 0)
+                    {
+                        Console.WriteLine($"Warning: Type '{specifiedName}' not found in assembly.");
+                    }
+                    else if (matches.Count > 1)
+                    {
+                        Console.WriteLine($"Warning: Multiple types match '{specifiedName}':");
+                        foreach (var match in matches)
+                        {
+                            Console.WriteLine($"  - {match}");
+                            queue.Enqueue(match);
+                            result.Add(match);
+                        }
+                    }
+                    else
+                    {
+                        queue.Enqueue(matches[0]);
+                        result.Add(matches[0]);
+                    }
+                }
+            }
+            
+            // BFS to collect all dependencies
+            while (queue.Count > 0)
+            {
+                var current = queue.Dequeue();
+                
+                if (dependencyGraph.TryGetValue(current, out var dependencies))
+                {
+                    foreach (var dep in dependencies)
+                    {
+                        if (!result.Contains(dep))
+                        {
+                            result.Add(dep);
+                            queue.Enqueue(dep);
+                        }
+                    }
+                }
+            }
+            
+            // Exclude nested types from the result (they will be moved with their declaring types)
+            return result.Where(name => !name.Contains('/')).ToHashSet();
         }
     }
 }
